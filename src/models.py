@@ -48,12 +48,16 @@ class CamEncode(nn.Module):
     def get_depth_dist(self, x, eps=1e-20):
         return x.softmax(dim=1)
 
+    # @info 计算深度分布和图像特征的外积，获得视椎特征
+    # @param x 骨干网络提取的特征图
     def get_depth_feat(self, x):
         x = self.get_eff_depth(x)
         # Depth
-        x = self.depthnet(x)
+        x = self.depthnet(x) #通过depthnet网络提取分类深度分布特征
 
+        # 取特征图的前D维，即分类深度分布特征，进行softmax归一化，转成深度概率图（深度分布）
         depth = self.get_depth_dist(x[:, :self.D])
+        # 计算深度分布和表示颜色的特征图的后C维的外积，获得视椎特征
         new_x = depth.unsqueeze(1) * x[:, self.D:(self.D + self.C)].unsqueeze(2)
 
         return depth, new_x
@@ -132,6 +136,13 @@ class LiftSplatShoot(nn.Module):
         self.grid_conf = grid_conf
         self.data_aug_conf = data_aug_conf
 
+        # 给定BEV网格在三个维度上的边界和步长如下
+        #   xbound=[-50.0, 50.0, 0.5]
+        #   ybound=[-50.0, 50.0, 0.5]
+        #   zbound=[-10.0, 10.0, 20.0]
+        # dx是每个BEV网格在x/y/z三个维度上的边长，即步长[0.50, 0.50, 20.00]
+        # bx是在x/y/z三个维度上第一个网格中心点坐标[-49.75, -49.75, 0.00]
+        # nx是在x/y/z三个维度上的网格数：[200, 200, 1]
         dx, bx, nx = gen_dx_bx(self.grid_conf['xbound'],
                                               self.grid_conf['ybound'],
                                               self.grid_conf['zbound'],
@@ -150,6 +161,8 @@ class LiftSplatShoot(nn.Module):
         # toggle using QuickCumsum vs. autograd
         self.use_quickcumsum = True
     
+    # @info 创建视椎体点云坐标（像素坐标）
+    # @return 返回形如[D,H,W,3]的视椎体点云坐标，其中D为深度，H为图像高，W为图像宽，3为坐标轴
     def create_frustum(self):
         # make grid in image plane
         ogfH, ogfW = self.data_aug_conf['final_dim']
@@ -163,6 +176,13 @@ class LiftSplatShoot(nn.Module):
         frustum = torch.stack((xs, ys, ds), -1)
         return nn.Parameter(frustum, requires_grad=False)
 
+    # @info 将视椎体点云从像素坐标系坐标转到雷达系
+    # @param rots 相机到雷达的旋转矩阵
+    # @param trans 相机到雷达的平移向量
+    # @param intrins 相机内参
+    # @param post_rots 图像增强变换矩阵-旋转
+    # @param post_trans 图像增强变换矩阵-平移
+    # @return 返回转到雷达系的视椎体点云坐标
     def get_geometry(self, rots, trans, intrins, post_rots, post_trans):
         """Determine the (x,y,z) locations (in the ego frame)
         of the points in the point cloud.
@@ -185,32 +205,53 @@ class LiftSplatShoot(nn.Module):
 
         return points
 
+    # @info 进行Lift操作，获得视椎特征
+    # @param x 骨干网络提取的特征图
+    # @return 视椎特征（点云）
     def get_cam_feats(self, x):
         """Return B x N x D x H/downsample x W/downsample x C
         """
         B, N, C, imH, imW = x.shape
 
+        # 将特征图的前两维合并，变成[B*N,C,H,W]
         x = x.view(B*N, C, imH, imW)
+        # 进行Lift操作，获得视椎特征
         x = self.camencode(x)
+        # 将视椎特征的维度还原成[B,N,C,D,H,W]
         x = x.view(B, N, self.camC, self.D, imH//self.downsample, imW//self.downsample)
+        # 将视椎特征图的维度进行转置，变成[batch_size、图像数、深度、img高、img宽、通道数]，即[B,N,D,H,W,C]
         x = x.permute(0, 1, 3, 4, 5, 2)
 
         return x
 
+    # @info 进行Splat操作，通过sum-pooling的方式，获得BEV特征
+    # @param geom_feats 视椎点云坐标，或几何特征
+    # @param x Lift操作获得的视椎特征
+    # @return BEV特征
     def voxel_pooling(self, geom_feats, x):
+
+        # 取得视椎特征的形状和特征点的总数
         B, N, D, H, W, C = x.shape
         Nprime = B*N*D*H*W
 
+        # 把视椎特征完全展平
         # flatten x
         x = x.reshape(Nprime, C)
 
+        # 把视椎点云坐标转成BEV网格坐标，并展平
+        # 需要注意的是，BEV网格的形状是[0.5, 0.5, 20]，BEV网格的数量是[200,200,1]，也就是说Z轴方向上只有一个网格，高度20米
+        # 视椎点云坐标转成BEV网格坐标后，Z轴方向上的坐标值都是0，也就是说所有的几何特征都在Z=0的平面上
+        # BEV网格实际是200×200个柱子，即BEV Pillar，每个柱子高度20米，柱子的宽度和长度都是0.5米
         # flatten indices
         geom_feats = ((geom_feats - (self.bx - self.dx/2.)) / self.dx).long()
         geom_feats = geom_feats.view(Nprime, 3)
+
+        # 创建批次索引，拼接到展平的视椎点云坐标后面，拼接后的形状为(Nprime, 4)，前三列分别是x,y,z，第4列是批次索引
         batch_ix = torch.cat([torch.full([Nprime//B, 1], ix,
                              device=x.device, dtype=torch.long) for ix in range(B)])
         geom_feats = torch.cat((geom_feats, batch_ix), 1)
 
+        # 过滤掉超出边界的视椎点云坐标和视椎特征
         # filter out points that are outside box
         kept = (geom_feats[:, 0] >= 0) & (geom_feats[:, 0] < self.nx[0])\
             & (geom_feats[:, 1] >= 0) & (geom_feats[:, 1] < self.nx[1])\
@@ -218,6 +259,9 @@ class LiftSplatShoot(nn.Module):
         x = x[kept]
         geom_feats = geom_feats[kept]
 
+        # 按照BEV视角下B、D、W、H的顺序，对视椎点云坐标和视椎特征进行升序排序
+        # D表示Z轴，W表示Y轴，H表示X轴
+        # 排序完成后，属于同一个BEV Pillar的视椎特征的ranks值是相同的
         # get tensors from the same voxel next to each other
         ranks = geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B)\
             + geom_feats[:, 1] * (self.nx[2] * B)\
@@ -226,25 +270,30 @@ class LiftSplatShoot(nn.Module):
         sorts = ranks.argsort()
         x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]
 
+        # 通过geom_feats中的网格索引，将feats中的特征值累加到对应的BEV网格中
         # cumsum trick
         if not self.use_quickcumsum:
             x, geom_feats = cumsum_trick(x, geom_feats, ranks)
         else:
             x, geom_feats = QuickCumsum.apply(x, geom_feats, ranks)
 
+        # 将累加后的特征值，按照B、C、Z、X、Y的顺序，转成BEV特征图
         # griddify (B x C x Z x X x Y)
         final = torch.zeros((B, C, self.nx[2], self.nx[0], self.nx[1]), device=x.device)
         final[geom_feats[:, 3], :, geom_feats[:, 2], geom_feats[:, 0], geom_feats[:, 1]] = x
 
+        # 折叠Z坐标
         # collapse Z
         final = torch.cat(final.unbind(dim=2), 1)
 
         return final
 
     def get_voxels(self, x, rots, trans, intrins, post_rots, post_trans):
+        # 获得视椎体点云坐标
         geom = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
+        #进行Lift操作，获得视椎特征
         x = self.get_cam_feats(x)
-
+        # 进行Splat操作，完成柱体池化，获得BEV特征
         x = self.voxel_pooling(geom, x)
 
         return x

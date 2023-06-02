@@ -178,15 +178,22 @@ def gen_dx_bx(xbound, ybound, zbound):
 
     return dx, bx, nx
 
-
+# @info 视椎体池化累加和技巧
+# @param x: [Nprime, C]，视椎特征
+# @param geom_feats: [Nprime, 4]，视椎几何特征
+# @param ranks: [Nprime]，视椎特征索引，如果特征索引相同，则表明落在同一个BEV网格内
 def cumsum_trick(x, geom_feats, ranks):
+    # 对展平的视椎特征[Nprime, C]按行累积求和，每一行的元素（表示一个像素特征）都是该行之前所有行元素的累积和
     x = x.cumsum(0)
+    # 判断每个特征索引是否与相邻的下一个特征索引不同，如果不同则为True，否则为False
     kept = torch.ones(x.shape[0], device=x.device, dtype=torch.bool)
     kept[:-1] = (ranks[1:] != ranks[:-1])
-
+    # 保留特征索引不同的特征
     x, geom_feats = x[kept], geom_feats[kept]
+    # 第一行视椎特征保留不变，剩余的每一行均减去前一行特征。
+    # 如果所有的特征索引均不相同，则x与按行求和之前的初始值完全相同。
+    # 如果有相同的特征索引，则具有相同特征索引的两个特征值会被累加在一起。
     x = torch.cat((x[:1], x[1:] - x[:-1]))
-
     return x, geom_feats
 
 
